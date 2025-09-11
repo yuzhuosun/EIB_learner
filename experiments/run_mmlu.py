@@ -11,7 +11,9 @@ from GDesigner.graph.graph import Graph
 from datasets.mmlu_dataset import MMLUDataset
 from datasets.MMLU.download import download
 from experiments.train_mmlu import train
+from experiments.train_moe_mmlu import train_moe
 from experiments.evaluate_mmlu import evaluate
+from experiments.evulate_moe_mmlu import evaluate_moe
 from GDesigner.utils.const import GDesigner_ROOT
 
 
@@ -47,6 +49,7 @@ def parse_args():
                         help="the decision method of the final node")
     parser.add_argument('--optimized_spatial',action='store_true')
     parser.add_argument('--optimized_temporal',action='store_true')
+    parser.add_argument('--moe', action='store_true')
     args = parser.parse_args()
     result_path = GDesigner_ROOT / "result"
     os.makedirs(result_path, exist_ok=True)
@@ -71,16 +74,33 @@ async def main():
                   optimized_spatial=args.optimized_spatial,
                   optimized_temporal=args.optimized_temporal,
                   **kwargs)
-    download()
+
     dataset_train = MMLUDataset('dev')
     dataset_val = MMLUDataset('val')
-    
+
     if args.optimized_spatial or args.optimized_temporal:
-        await train(graph=graph,dataset=dataset_train,num_iters=args.num_iterations,num_rounds=args.num_rounds,
-                    lr=args.lr,batch_size=args.batch_size)
-        
-    
-    score = await evaluate(graph=graph,dataset=dataset_val,num_rounds=args.num_rounds,limit_questions=limit_questions,eval_batch_size=args.batch_size)
+        if args.moe:
+            print("----------train moe-------------")
+            await train_moe(graph=graph,dataset=dataset_train,num_iters=args.num_iterations,num_rounds=args.num_rounds,
+                        lr=args.lr,batch_size=args.batch_size)
+
+            import torch
+            
+        else:
+            await train(graph=graph, dataset=dataset_train, num_iters=args.num_iterations, num_rounds=args.num_rounds,
+                        lr=args.lr, batch_size=args.batch_size)
+            import torch
+            graph.gcn.load_state_dict(torch.load('/home/shenxu/my_project/experiments/gcn_model.pth'))
+            graph.mlp.load_state_dict(torch.load('/home/shenxu/my_project/experiments/mlp_model.pth'))
+            graph.gcn_chain.load_state_dict(torch.load('/home/shenxu/my_project/experiments/gcn_chain.pth'))
+            graph.mlp_chain.load_state_dict(torch.load('/home/shenxu/my_project/experiments/mlp_chain.pth'))
+            graph.mlp_fuse.load_state_dict(torch.load('/home/shenxu/my_project/experiments/mlp_fuse.pth'))
+    if args.moe:
+        print("----------evaluate moe-------------")
+        score = await evaluate_moe(graph=graph, dataset=dataset_val, num_rounds=args.num_rounds,
+                               limit_questions=limit_questions, eval_batch_size=args.batch_size)
+    else:
+        score = await evaluate(graph=graph,dataset=dataset_val,num_rounds=args.num_rounds,limit_questions=limit_questions,eval_batch_size=args.batch_size)
     print(f"Score: {score}")
 
 
@@ -153,7 +173,7 @@ def get_kwargs(mode:Union[Literal['DirectAnswer'],Literal['FullConnected'],Liter
         node_kwargs = [{'role':'Fake'} if i % 2 == N % 2 else {'role':'Normal'} for i in range(N)]
     elif 'Fake' in mode and 'AG' in mode:
         node_kwargs = [{'role':'Fake'} if i % 2 == N % 2 else {'role':None} for i in range(N)]
-        
+
     return {"initial_spatial_probability": initial_spatial_probability,
             "fixed_spatial_masks": fixed_spatial_masks,
             "initial_temporal_probability": initial_temporal_probability,
