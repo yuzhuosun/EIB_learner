@@ -10,12 +10,11 @@ import random
 from GDesigner.graph.graph import Graph
 from datasets.mmlu_dataset import MMLUDataset
 from datasets.MMLU.download import download
-from experiments.train_mmlu import train
-from experiments.train_moe_mmlu import train_moe
+
 from experiments.evaluate_mmlu import evaluate
-from experiments.evulate_moe_mmlu import evaluate_moe
 from GDesigner.utils.const import GDesigner_ROOT
 
+from eib_train_mmlu import train
 
 
 def parse_args():
@@ -81,20 +80,23 @@ async def main():
     if args.optimized_spatial or args.optimized_temporal:
         if args.moe:
             print("----------train moe-------------")
-            await train_moe(graph=graph,dataset=dataset_train,num_iters=args.num_iterations,num_rounds=args.num_rounds,
-                        lr=args.lr,batch_size=args.batch_size)
-
+           
             import torch
             
         else:
             await train(graph=graph, dataset=dataset_train, num_iters=args.num_iterations, num_rounds=args.num_rounds,
                         lr=args.lr, batch_size=args.batch_size)
             import torch
-            graph.gcn.load_state_dict(torch.load('/home/shenxu/my_project/experiments/gcn_model.pth'))
-            graph.mlp.load_state_dict(torch.load('/home/shenxu/my_project/experiments/mlp_model.pth'))
-            graph.gcn_chain.load_state_dict(torch.load('/home/shenxu/my_project/experiments/gcn_chain.pth'))
-            graph.mlp_chain.load_state_dict(torch.load('/home/shenxu/my_project/experiments/mlp_chain.pth'))
-            graph.mlp_fuse.load_state_dict(torch.load('/home/shenxu/my_project/experiments/mlp_fuse.pth'))
+            gcn_model_path = ""
+            mlp_mode_path = ""
+            gcn_chain_path = ""
+            mlp_chain_path = ""
+            mlp_fuse_path = ""
+            graph.gcn.load_state_dict(torch.load(gcn_model_path))
+            graph.mlp.load_state_dict(torch.load(mlp_mode_path))
+            graph.gcn_chain.load_state_dict(torch.load(gcn_chain_path))
+            graph.mlp_chain.load_state_dict(torch.load(mlp_chain_path))
+            graph.mlp_fuse.load_state_dict(torch.load(mlp_fuse_path))
     if args.moe:
         print("----------evaluate moe-------------")
         score = await evaluate_moe(graph=graph, dataset=dataset_val, num_rounds=args.num_rounds,
