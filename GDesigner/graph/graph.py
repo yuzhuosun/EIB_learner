@@ -9,9 +9,9 @@ from GDesigner.graph.node import Node
 from GDesigner.agents.agent_registry import AgentRegistry
 from GDesigner.prompt.prompt_set_registry import PromptSetRegistry
 from GDesigner.llm.profile_embedding import get_sentence_embedding
-from GDesigner.gnn.gcn import GCN,MLP
+from GDesigner.gnn.gcn import GCN,MLP,Gating,Expert,MoE
 from torch_geometric.utils import dense_to_sparse
-
+import random
 class Graph(ABC):
     """
     A framework for managing and executing a network of nodes using a language model.
@@ -33,6 +33,15 @@ class Graph(ABC):
         add_node(node): Adds a new node to the graph with a unique identifier.
         run(inputs, num_steps=10, single_agent=False): Executes the graph for a specified number of steps, processing provided inputs.
     """
+
+
+# {"initial_spatial_probability": initial_spatial_probability,
+#             "fixed_spatial_masks": fixed_spatial_masks,
+#             "initial_temporal_probability": initial_temporal_probability,
+#             "fixed_temporal_masks": fixed_temporal_masks,
+#             "node_kwargs":node_kwargs}
+
+
 
     def __init__(self, 
                 domain: str,
@@ -63,26 +72,38 @@ class Graph(ABC):
         self.agent_names:List[str] = agent_names
         self.optimized_spatial = optimized_spatial
         self.optimized_temporal = optimized_temporal
+        self.decision_method = decision_method
         self.decision_node:Node = AgentRegistry.get(decision_method, **{"domain":self.domain,"llm_name":self.llm_name})
         self.nodes:Dict[str,Node] = {}
         self.potential_spatial_edges:List[List[str, str]] = []
         self.potential_temporal_edges:List[List[str,str]] = []
         self.node_kwargs = node_kwargs if node_kwargs is not None else [{} for _ in agent_names]
-        
         self.init_nodes() # add nodes to the self.nodes
         self.init_potential_edges() # add potential edges to the self.potential_spatial/temporal_edges
-        
         self.prompt_set = PromptSetRegistry.get(domain)
         self.role_adj_matrix = self.construct_adj_matrix()
+        self.role_chain_matrix = self.construct_chain_matrix()
+        self.role_random_matrix = self.construct_random_matrix()
         self.features = self.construct_features()
+        # import ipdb;ipdb.set_trace()
         self.gcn = GCN(self.features.size(1)*2,16,self.features.size(1))
         self.mlp = MLP(384,16,16)
-
+        self.gcn_chain = GCN(self.features.size(1)*2,16,self.features.size(1))
+        self.mlp_chain = MLP(384, 16, 16)
+        self.gcn_random= GCN(self.features.size(1) * 2, 16, self.features.size(1))
+        self.mlp_random = MLP(384, 16, 16)
+        self.mlp_fuse = MLP(self.num_nodes*2,16,self.num_nodes)
+        self.gating = Gating(384,2)
+        self.expert1 = Expert(self.features.size(1)*2,16,self.features.size(1))
+        self.expert2 = Expert(self.features.size(1) * 2, 16, self.features.size(1))
+        self.expert3 = Expert(self.features.size(1) * 2, 16, self.features.size(1))
+        #self.moe = MoE([self.expert1,self.expert2,self.expert3],384)
+        self.experts = [self.expert1,self.expert2,self.expert3]
         init_spatial_logit = torch.log(torch.tensor(initial_spatial_probability / (1 - initial_spatial_probability))) if optimized_spatial else 10.0
         # self.spatial_logits = torch.nn.Parameter(torch.ones(len(self.potential_spatial_edges), requires_grad=optimized_spatial) * init_spatial_logit,
-        #                                          requires_grad=optimized_spatial) # trainable edge logits
+        #                                          requires_grad=optimized_spatial) # trainable edge logitsd
         self.spatial_masks = torch.nn.Parameter(fixed_spatial_masks,requires_grad=False)  # fixed edge masks
-
+        self.adj_list = [self.role_adj_matrix,self.role_chain_matrix,self.role_random_matrix]
         init_temporal_logit = torch.log(torch.tensor(initial_temporal_probability / (1 - initial_temporal_probability))) if optimized_temporal else 10.0
         self.temporal_logits = torch.nn.Parameter(torch.ones(len(self.potential_temporal_edges), requires_grad=optimized_temporal) * init_temporal_logit,
                                                  requires_grad=optimized_temporal) # trainable edge logits
@@ -112,23 +133,56 @@ class Graph(ABC):
         
         edge_index, edge_weight = dense_to_sparse(role_adj)
         return edge_index
-    
+
+    def construct_chain_matrix(self):
+        num_nodes = self.num_nodes
+        edge_list = []
+
+        # 按顺序连接 i -> i+1
+        for i in range(num_nodes - 1):
+            edge_list.append((i, i + 1))
+
+        # 转换为 edge_index 格式
+        edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()  # shape [2, E]
+
+        return edge_index
+
+    def construct_random_matrix(self):
+        num_nodes = self.num_nodes
+        role_adj = torch.zeros((num_nodes, num_nodes))
+
+        # 构建链式连接：node 0 -> node 1 -> ... -> node N-1
+        for i in range(num_nodes - 1):
+            role_adj[i][i + 1] = 1
+
+        # 为每个节点（除最后一个）额外加一条非重复的随机边
+        for i in range(num_nodes - 1):
+            possible_targets = [j for j in range(num_nodes) if j != i + 1 and j != i]
+            if possible_targets:
+                j = random.choice(possible_targets)
+                role_adj[i][j] = 1
+
+        edge_index, edge_weight = dense_to_sparse(role_adj)
+        return edge_index
     def construct_features(self):
         features = []
         for node_id in self.nodes:
             role = self.nodes[node_id].role
+            # import ipdb;ipdb.set_trace()
             profile = self.prompt_set.get_description(role)
             feature = get_sentence_embedding(profile)
             features.append(feature)
         features = torch.tensor(np.array(features))
         return features
-    
-    def construct_new_features(self, query):
+    def construct_query_features(self,query):
         query_embedding = torch.tensor(get_sentence_embedding(query))
+        return query_embedding
+    def construct_new_features(self, query):
+        query_embedding = self.construct_query_features(query)
         query_embedding = query_embedding.unsqueeze(0).repeat((self.num_nodes,1))
         new_features = torch.cat((self.features,query_embedding),dim=1)
         return new_features
-        
+
     @property
     def spatial_adj_matrix(self):
         matrix = np.zeros((len(self.nodes), len(self.nodes)))
@@ -221,12 +275,14 @@ class Graph(ABC):
         for potential_connection, edge_logit, edge_mask in zip(self.potential_spatial_edges, self.spatial_logits, self.spatial_masks):
             out_node:Node = self.find_node(potential_connection[0])
             in_node:Node = self.find_node(potential_connection[1])
-            if edge_mask == 0.0:
-                continue
-            elif edge_mask == 1.0 and self.optimized_spatial==False:
-                if not self.check_cycle(in_node, {out_node}):
-                    out_node.add_successor(in_node,'spatial')
-                continue
+            # if edge_mask == 0.0:
+            #     continue
+            # elif edge_mask == 1.0 and self.optimized_spatial==False:
+            #     if not self.check_cycle(in_node, {out_node}):
+            #         out_node.add_successor(in_node,'spatial')
+            #     continue
+
+            ##failure detection , failure step drop -> calling llm to refine
             if not self.check_cycle(in_node, {out_node}):
                 edge_prob = torch.sigmoid(edge_logit / temperature)
                 if threshold:
@@ -266,6 +322,7 @@ class Graph(ABC):
         return torch.sum(torch.stack(log_probs))
 
 
+
     def run(self, inputs: Any, 
                   num_rounds:int = 3, 
                   max_tries: int = 3, 
@@ -275,7 +332,7 @@ class Graph(ABC):
         for round in range(num_rounds):
             log_probs += self.construct_spatial_connection()
             log_probs += self.construct_temporal_connection(round)
-            
+
             in_degree = {node_id: len(node.spatial_predecessors) for node_id, node in self.nodes.items()}
             zero_in_degree_queue = [node_id for node_id, deg in in_degree.items() if deg == 0]
 
@@ -306,18 +363,147 @@ class Graph(ABC):
             
         return final_answers, log_probs
 
-    async def arun(self, input: Dict[str,str], 
+    async def arun_save(self, input: Dict[str, str],
+                   num_rounds: int = 3,
+                   max_tries: int = 3,
+                   max_time: int = 600, ) -> List[Any]:
+        # inputs:{'task':"xxx"}
+        log_probs = 0
+        new_features = self.construct_new_features(input['task'])
+        logits = self.gcn(new_features, self.role_adj_matrix)
+        logits = self.mlp(logits)
+        self.spatial_logits = logits @ logits.t()
+        self.spatial_logits = min_max_norm(torch.flatten(self.spatial_logits))
+        history = []
+        for round in range(num_rounds):
+            log_probs += self.construct_spatial_connection()
+            log_probs += self.construct_temporal_connection(round)
+
+            in_degree = {node_id: len(node.spatial_predecessors) for node_id, node in self.nodes.items()}
+            zero_in_degree_queue = [node_id for node_id, deg in in_degree.items() if deg == 0]
+            # node.role -> "role", node->content
+            while zero_in_degree_queue:
+                current_node_id = zero_in_degree_queue.pop(0)
+                tries = 0
+                while tries < max_tries:
+                    try:
+                        await asyncio.wait_for(self.nodes[current_node_id].async_execute_result(input),
+                                               timeout=max_time)  # output is saved in the node.outputs
+                        step = {"role":self.nodes[current_node_id].role,"content":self.nodes[current_node_id].current_result}
+                        history.append(step)
+                        break
+                    except Exception as e:
+                        print(f"Error during execution of node {current_node_id}: {e}")
+                    tries += 1
+                for successor in self.nodes[current_node_id].spatial_successors:
+                    if successor.id not in self.nodes.keys():
+                        continue
+                    in_degree[successor.id] -= 1
+                    if in_degree[successor.id] == 0:
+                        zero_in_degree_queue.append(successor.id)
+
+            self.update_memory()
+
+        self.connect_decision_node()
+        await self.decision_node.async_execute(input)
+        final_answers = self.decision_node.outputs
+        history.append({"role":self.decision_method,"content":final_answers})
+        combined_data = {
+
+            "question": input,
+
+            "history": history
+        }
+        if len(final_answers) == 0:
+            final_answers.append("No answer of the decision node")
+        return final_answers, log_probs,combined_data
+    async def arun(self, input: Dict[str, str],
+                   num_rounds: int = 3,
+                   max_tries: int = 3,
+                   max_time: int = 600, ) -> List[Any]:
+        # inputs:{'task':"xxx"}
+        log_probs = 0
+        new_features = self.construct_new_features(input['task'])
+        logits = self.gcn(new_features, self.role_adj_matrix)
+        logits = self.mlp(logits)
+        self.spatial_logits = logits @ logits.t()
+        self.spatial_logits = min_max_norm(torch.flatten(self.spatial_logits))
+
+        for round in range(num_rounds):
+            log_probs += self.construct_spatial_connection()
+            log_probs += self.construct_temporal_connection(round)
+
+            in_degree = {node_id: len(node.spatial_predecessors) for node_id, node in self.nodes.items()}
+            zero_in_degree_queue = [node_id for node_id, deg in in_degree.items() if deg == 0]
+            #node.role -> "role", node->content
+            while zero_in_degree_queue:
+                current_node_id = zero_in_degree_queue.pop(0)
+                tries = 0
+                while tries < max_tries:
+                    try:
+                        await asyncio.wait_for(self.nodes[current_node_id].async_execute(input),
+                                               timeout=max_time)  # output is saved in the node.outputs
+                        break
+                    except Exception as e:
+                        print(f"Error during execution of node {current_node_id}: {e}")
+                    tries += 1
+                for successor in self.nodes[current_node_id].spatial_successors:
+                    if successor.id not in self.nodes.keys():
+                        continue
+                    in_degree[successor.id] -= 1
+                    if in_degree[successor.id] == 0:
+                        zero_in_degree_queue.append(successor.id)
+
+            self.update_memory()
+
+        self.connect_decision_node()
+        await self.decision_node.async_execute(input)
+        final_answers = self.decision_node.outputs
+        if len(final_answers) == 0:
+            final_answers.append("No answer of the decision node")
+        return final_answers, log_probs
+    async def arunmoe(self, input: Dict[str,str],
                   num_rounds:int = 3, 
                   max_tries: int = 3, 
                   max_time: int = 600,) -> List[Any]:
         # inputs:{'task':"xxx"}
         log_probs = 0
         new_features = self.construct_new_features(input['task'])
-        logits = self.gcn(new_features,self.role_adj_matrix)
-        logits = self.mlp(logits)
-        self.spatial_logits = logits @ logits.t()
-        self.spatial_logits = min_max_norm(torch.flatten(self.spatial_logits))
+        # logits = self.gcn(new_features,self.role_adj_matrix)
+        # logits = self.mlp(logits)
+        # self.spatial_logits = logits @ logits.t()
+        # self.spatial_logits = min_max_norm(torch.flatten(self.spatial_logits))
+        query_feature = self.construct_query_features(input['task'])
+        # weight = self.gating(query_feature)
 
+        weights = self.gating(query_feature)
+        # self.expert1(new_features,self.adj_list[0])
+        logits1 = self.gcn(new_features, self.role_adj_matrix)
+        logits1 = self.mlp(logits1)
+        spatial_logits1 = logits1 @ logits1.t()
+        spatial_logits1 = min_max_norm(torch.flatten(spatial_logits1))
+        logits2 = self.gcn_chain(new_features, self.role_chain_matrix)
+        logits2 = self.mlp_chain(logits2)
+        spatial_logits2 = logits2 @ logits2.t()
+        spatial_logits2 = min_max_norm(torch.flatten(spatial_logits2))
+        # logits3 = self.gcn_random(new_features, self.role_random_matrix)
+        # logits3 = self.mlp_chain(logits3)
+        # spatial_logits3 = logits3 @ logits3.t()
+        # spatial_logits3 = min_max_norm(torch.flatten(spatial_logits3))
+        outputs = torch.stack([spatial_logits1,spatial_logits2],dim=1)
+        #outputs = torch.stack([self.expert1(new_features,self.adj_list[0]),self.expert2(new_features,self.adj_list[1]),self.expert3(new_features,self.adj_list[2])],dim=1)
+        # Calculate the expert outputs
+        # outputs = torch.stack(
+        #     [expert(new_features, self.adj_list[i]) for i, expert in enumerate(self.experts)], dim=1)
+
+        # Adjust the weights tensor shape to match the expert outputs
+        weights = torch.unsqueeze(weights, dim=1)
+
+        # Multiply the expert outputs with the weights and
+        # sum along the third dimension
+
+        self.spatial_logits= min_max_norm(torch.flatten(outputs @ weights))
+        # print(weights.shape)
         for round in range(num_rounds):
             log_probs += self.construct_spatial_connection()
             log_probs += self.construct_temporal_connection(round)
@@ -350,7 +536,181 @@ class Graph(ABC):
         if len(final_answers) == 0:
             final_answers.append("No answer of the decision node")
         return final_answers, log_probs
-    
+
+    async def arunmoev2(self, input: Dict[str, str],
+                      num_rounds: int = 3,
+                      max_tries: int = 3,
+                      max_time: int = 600, ) -> List[Any]:
+        # inputs:{'task':"xxx"}
+        log_probs = 0
+        new_features = self.construct_new_features(input['task'])
+        # logits = self.gcn(new_features,self.role_adj_matrix)
+        # logits = self.mlp(logits)
+        # self.spatial_logits = logits @ logits.t()
+        # self.spatial_logits = min_max_norm(torch.flatten(self.spatial_logits))
+        query_feature = self.construct_query_features(input['task'])
+        # weight = self.gating(query_feature)
+
+        #weights = self.gating(query_feature)
+        # self.expert1(new_features,self.adj_list[0])
+        logits1 = self.gcn(new_features, self.role_adj_matrix)
+        logits1 = self.mlp(logits1)
+        spatial_logits1 = logits1 @ logits1.t()
+        #spatial_logits1 = min_max_norm(torch.flatten(spatial_logits1))
+        logits2 = self.gcn_chain(new_features, self.role_chain_matrix)
+        logits2 = self.mlp_chain(logits2)
+        spatial_logits2 = logits2 @ logits2.t()
+        #spatial_logits2 = min_max_norm(torch.flatten(spatial_logits2))
+        # logits3 = self.gcn_random(new_features, self.role_random_matrix)
+        # logits3 = self.mlp_chain(logits3)
+        # spatial_logits3 = logits3 @ logits3.t()
+        # spatial_logits3 = min_max_norm(torch.flatten(spatial_logits3))
+        # outputs = torch.stack([spatial_logits1, spatial_logits2], dim=1)
+        # outputs = torch.stack([self.expert1(new_features,self.adj_list[0]),self.expert2(new_features,self.adj_list[1]),self.expert3(new_features,self.adj_list[2])],dim=1)
+        # Calculate the expert outputs
+        # outputs = torch.stack(
+        #     [expert(new_features, self.adj_list[i]) for i, expert in enumerate(self.experts)], dim=1)
+
+        # Adjust the weights tensor shape to match the expert outputs
+        #weights = torch.unsqueeze(weights, dim=1)
+
+        # Multiply the expert outputs with the weights and
+        # sum along the third dimension
+
+        self.spatial_logits = self.mlp_fuse(torch.cat([spatial_logits1, spatial_logits2], dim=1))
+        self.spatial_logits = min_max_norm(torch.flatten(self.spatial_logits))
+        # print(weights.shape)
+        for round in range(num_rounds):
+            log_probs += self.construct_spatial_connection()
+            log_probs += self.construct_temporal_connection(round)
+
+            in_degree = {node_id: len(node.spatial_predecessors) for node_id, node in self.nodes.items()}
+            zero_in_degree_queue = [node_id for node_id, deg in in_degree.items() if deg == 0]
+
+            while zero_in_degree_queue:
+                current_node_id = zero_in_degree_queue.pop(0)
+                tries = 0
+                while tries < max_tries:
+                    try:
+                        await asyncio.wait_for(self.nodes[current_node_id].async_execute(input),
+                                               timeout=max_time)  # output is saved in the node.outputs
+                        break
+                    except Exception as e:
+                        print(f"Error during execution of node {current_node_id}: {e}")
+                    tries += 1
+                for successor in self.nodes[current_node_id].spatial_successors:
+                    if successor.id not in self.nodes.keys():
+                        continue
+                    in_degree[successor.id] -= 1
+                    if in_degree[successor.id] == 0:
+                        zero_in_degree_queue.append(successor.id)
+
+            self.update_memory()
+
+        self.connect_decision_node()
+        await self.decision_node.async_execute(input)
+        final_answers = self.decision_node.outputs
+        if len(final_answers) == 0:
+            final_answers.append("No answer of the decision node")
+        return final_answers, log_probs
+    async def arunchain(self, input: Dict[str, str],
+                   num_rounds: int = 3,
+                   max_tries: int = 3,
+                   max_time: int = 600, ) -> List[Any]:
+        # inputs:{'task':"xxx"}
+        log_probs = 0
+        new_features = self.construct_new_features(input['task'])
+        logits = self.gcn_chain(new_features, self.role_chain_matrix)
+        logits = self.mlp_chain(logits)
+        self.spatial_logits = logits @ logits.t()
+        self.spatial_logits = min_max_norm(torch.flatten(self.spatial_logits))
+
+        for round in range(num_rounds):
+            log_probs += self.construct_spatial_connection()
+            log_probs += self.construct_temporal_connection(round)
+
+            in_degree = {node_id: len(node.spatial_predecessors) for node_id, node in self.nodes.items()}
+            zero_in_degree_queue = [node_id for node_id, deg in in_degree.items() if deg == 0]
+
+            while zero_in_degree_queue:
+                current_node_id = zero_in_degree_queue.pop(0)
+                tries = 0
+                while tries < max_tries:
+                    try:
+                        await asyncio.wait_for(self.nodes[current_node_id].async_execute(input),
+                                               timeout=max_time)  # output is saved in the node.outputs
+                        break
+                    except Exception as e:
+                        print(f"Error during execution of node {current_node_id}: {e}")
+                    tries += 1
+                for successor in self.nodes[current_node_id].spatial_successors:
+                    if successor.id not in self.nodes.keys():
+                        continue
+                    in_degree[successor.id] -= 1
+                    if in_degree[successor.id] == 0:
+                        zero_in_degree_queue.append(successor.id)
+
+            self.update_memory()
+
+        self.connect_decision_node()
+        await self.decision_node.async_execute(input)
+        final_answers = self.decision_node.outputs
+        if len(final_answers) == 0:
+            final_answers.append("No answer of the decision node")
+        return final_answers, log_probs
+
+    async def arunfuse(self, input: Dict[str, str],
+                   num_rounds: int = 3,
+                   max_tries: int = 3,
+                   max_time: int = 600, ) -> List[Any]:
+        # inputs:{'task':"xxx"}
+        new_features = self.construct_new_features(input['task'])
+        logits = self.gcn(new_features, self.role_adj_matrix)
+        logits = self.mlp(logits)
+        fc_logits = logits @ logits.t()
+        #fc_logits = min_max_norm(fc_logits)
+        log_probs = 0
+        new_features = self.construct_new_features(input['task'])
+        logits = self.gcn_chain(new_features, self.role_chain_matrix)
+        logits = self.mlp_chain(logits)
+        chain_logits = logits @ logits.t()
+        #chain_logits = min_max_norm(chain_logits)
+        self.spatial_logits = self.mlp_fuse(torch.cat([fc_logits,chain_logits], dim=1))
+        self.spatial_logits = min_max_norm(torch.flatten(self.spatial_logits))
+        for round in range(num_rounds):
+            log_probs += self.construct_spatial_connection()
+            log_probs += self.construct_temporal_connection(round)
+
+            in_degree = {node_id: len(node.spatial_predecessors) for node_id, node in self.nodes.items()}
+            zero_in_degree_queue = [node_id for node_id, deg in in_degree.items() if deg == 0]
+
+            while zero_in_degree_queue:
+                current_node_id = zero_in_degree_queue.pop(0)
+                tries = 0
+                while tries < max_tries:
+                    try:
+                        await asyncio.wait_for(self.nodes[current_node_id].async_execute(input),
+                                               timeout=max_time)  # output is saved in the node.outputs
+                        break
+                    except Exception as e:
+                        print(f"Error during execution of node {current_node_id}: {e}")
+                    tries += 1
+                for successor in self.nodes[current_node_id].spatial_successors:
+                    if successor.id not in self.nodes.keys():
+                        continue
+                    in_degree[successor.id] -= 1
+                    if in_degree[successor.id] == 0:
+                        zero_in_degree_queue.append(successor.id)
+
+            self.update_memory()
+
+        self.connect_decision_node()
+        await self.decision_node.async_execute(input)
+        final_answers = self.decision_node.outputs
+        if len(final_answers) == 0:
+            final_answers.append("No answer of the decision node")
+        return final_answers, log_probs
+
     def update_memory(self):
         for id,node in self.nodes.items():
             node.update_memory()
