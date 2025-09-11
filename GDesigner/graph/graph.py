@@ -138,11 +138,9 @@ class Graph(ABC):
         num_nodes = self.num_nodes
         edge_list = []
 
-        # 按顺序连接 i -> i+1
         for i in range(num_nodes - 1):
             edge_list.append((i, i + 1))
 
-        # 转换为 edge_index 格式
         edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()  # shape [2, E]
 
         return edge_index
@@ -151,11 +149,10 @@ class Graph(ABC):
         num_nodes = self.num_nodes
         role_adj = torch.zeros((num_nodes, num_nodes))
 
-        # 构建链式连接：node 0 -> node 1 -> ... -> node N-1
+   
         for i in range(num_nodes - 1):
             role_adj[i][i + 1] = 1
 
-        # 为每个节点（除最后一个）额外加一条非重复的随机边
         for i in range(num_nodes - 1):
             possible_targets = [j for j in range(num_nodes) if j != i + 1 and j != i]
             if possible_targets:
