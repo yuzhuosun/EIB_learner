@@ -49,6 +49,39 @@ API_KEY="..."    # 你的 API Key
 
 > 注意：代码通过 `GDesigner/llm/gpt_chat.py` 读取环境变量并发起请求；若未配置会在调用模型时失败。
 
+
+
+### 使用 Ollama 本地模型（你当前的场景）
+
+如果你没有 OpenAI API，只用本地 `ollama`（例如 `qwen2.5:3b`），按下面配置：
+
+1) 先启动 Ollama 服务并拉模型：
+
+```bash
+ollama serve
+ollama pull qwen2.5:3b
+```
+
+2) 修改 `.env`：
+
+```bash
+LLM_PROVIDER='ollama'
+BASE_URL='http://127.0.0.1:11434/api/chat'
+API_KEY=''
+```
+
+3) 运行脚本时指定本地模型名：
+
+```bash
+python experiments/run_mmlu.py \
+  --llm_name qwen2.5:3b \
+  --mode FullConnected \
+  --batch_size 1 \
+  --agent_nums 2 \
+  --num_iterations 1 \
+  --num_rounds 1
+```
+
 ---
 
 ## 4. 数据准备

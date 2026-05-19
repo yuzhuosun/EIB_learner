@@ -10,38 +10,56 @@ from GDesigner.llm.price import cost_count
 from GDesigner.llm.llm import LLM
 from GDesigner.llm.llm_registry import LLMRegistry
 
-
-OPENAI_API_KEYS = ['']
-BASE_URL = ''
-
 load_dotenv()
-MINE_BASE_URL = os.getenv('BASE_URL')
-MINE_API_KEYS = os.getenv('API_KEY')
+
+LLM_PROVIDER = os.getenv('LLM_PROVIDER', 'openai_compatible').strip().lower()
+BASE_URL = os.getenv('BASE_URL', '').strip()
+API_KEY = os.getenv('API_KEY', '').strip()
 
 
 @retry(wait=wait_random_exponential(max=100), stop=stop_after_attempt(3))
 async def achat(
     model: str,
     msg: List[Dict],):
-    request_url = MINE_BASE_URL
-    authorization_key = MINE_API_KEYS
-    headers = {
-        'Content-Type': 'application/json',
-        'authorization': authorization_key
-    }
+    request_url = BASE_URL
+    messages = [{"role": m.role, "content": m.content} if isinstance(m, Message) else m for m in msg]
+
+    if LLM_PROVIDER == 'ollama':
+        headers = {'Content-Type': 'application/json'}
+        data = {
+            "model": model,
+            "messages": messages,
+            "stream": False,
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.post(request_url, headers=headers, json=data) as response:
+                response.raise_for_status()
+                response_data = await response.json()
+                answer = response_data.get('message', {}).get('content', '')
+                prompt = "".join([item['content'] for item in messages])
+                if answer:
+                    cost_count(prompt, answer, model)
+                return answer
+
+    headers = {'Content-Type': 'application/json'}
+    if API_KEY:
+        headers['authorization'] = API_KEY
+
     data = {
         "name": model,
         "inputs": {
             "stream": False,
-            "msg": repr(msg),
+            "msg": repr(messages),
         }
     }
     async with aiohttp.ClientSession() as session:
-        async with session.post(request_url, headers=headers ,json=data) as response:
+        async with session.post(request_url, headers=headers, json=data) as response:
+            response.raise_for_status()
             response_data = await response.json()
-            prompt = "".join([item['content'] for item in msg])
-            cost_count(prompt,response_data['data'],model)
+            prompt = "".join([item['content'] for item in messages])
+            cost_count(prompt, response_data['data'], model)
             return response_data['data']
+
 
 @LLMRegistry.register('GPTChat')
 class GPTChat(LLM):
@@ -63,11 +81,11 @@ class GPTChat(LLM):
             temperature = self.DEFAULT_TEMPERATURE
         if num_comps is None:
             num_comps = self.DEFUALT_NUM_COMPLETIONS
-        
+
         if isinstance(messages, str):
             messages = [Message(role="user", content=messages)]
-        return await achat(self.model_name,messages)
-    
+        return await achat(self.model_name, messages)
+
     def gen(
         self,
         messages: List[Message],
